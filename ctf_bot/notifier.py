@@ -54,19 +54,18 @@ def find_new_contests(previous_db_path: str | Path, current_db_path: str | Path)
         logging.info("Previous CTF DB not found at %s. Skipping notifications for bootstrap run.", previous_path)
         return []
 
-    previous_contests = _load_contests(previous_path)
     current_contests = _load_contests(current_path)
-
+    previous_contests = _load_contests(previous_path)
     previous_keys = {contest.contest_key for contest in previous_contests}
-    new_contests = [contest for contest in current_contests if contest.contest_key not in previous_keys]
-    new_contests.sort(
+    contests = [contest for contest in current_contests if contest.contest_key not in previous_keys]
+    contests.sort(
         key=lambda contest: (
             _status_rank(contest.status),
             contest.start or datetime.max.replace(tzinfo=timezone.utc),
             contest.title.casefold(),
         )
     )
-    return new_contests
+    return contests
 
 
 async def send_new_contest_notifications(
@@ -76,7 +75,7 @@ async def send_new_contest_notifications(
     timeout_seconds: float,
 ) -> int:
     if not contests:
-        logging.info("No new CTF contests detected.")
+        logging.info("No CTF contests to notify.")
         return 0
 
     timeout = aiohttp.ClientTimeout(total=timeout_seconds)
@@ -84,7 +83,7 @@ async def send_new_contest_notifications(
         webhook = discord.Webhook.from_url(webhook_url, session=session)
         sent = 0
         for contest in contests:
-            embed = build_stored_contest_embeds("신규 CTF", [contest])[0]
+            embed = build_stored_contest_embeds("CTF 알림", [contest])[0]
             await webhook.send(
                 content=f"새 CTF 감지 | {_status_label(contest.status)} | {contest.source_label}",
                 embed=embed,
@@ -163,7 +162,7 @@ def main() -> None:
             dry_run=args.dry_run,
         )
     )
-    logging.info("Processed %s new contest notification(s).", sent)
+    logging.info("Processed %s contest notification(s).", sent)
 
 
 if __name__ == "__main__":
