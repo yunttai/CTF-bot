@@ -12,7 +12,6 @@ import discord
 from dotenv import load_dotenv
 
 from ctf_bot.formatters import build_stored_contest_embeds
-from ctf_bot.models import StoredContest
 from ctf_bot.storage import DEFAULT_DB_PATH, ContestRepository, StorageError
 
 
@@ -23,14 +22,6 @@ def _read_float(name: str, default: float) -> float:
     return float(value)
 
 
-def _status_rank(status: str) -> int:
-    order = {
-        "ongoing": 0,
-        "upcoming": 1,
-    }
-    return order.get(status, 99)
-
-
 def _status_label(status: str) -> str:
     labels = {
         "ongoing": "진행 중",
@@ -39,70 +30,17 @@ def _status_label(status: str) -> str:
     return labels.get(status, status)
 
 
-def _load_contests(db_path: str | Path) -> list[StoredContest]:
-    repository = ContestRepository(str(db_path))
-    return repository.list_contests()
-
-
-def find_new_contests(previous_db_path: str | Path, current_db_path: str | Path) -> list[StoredContest]:
-    current_path = Path(current_db_path)
-    if not current_path.exists():
-        raise StorageError(f"Current CTF DB not found: {current_path}")
-
-    previous_path = Path(previous_db_path)
-    if not previous_path.exists():
-        logging.info("Previous CTF DB not found at %s. Skipping notifications for bootstrap run.", previous_path)
-        return []
-
-    current_contests = _load_contests(current_path)
-    previous_contests = _load_contests(previous_path)
-    previous_keys = {contest.contest_key for contest in previous_contests}
-    contests = [contest for contest in current_contests if contest.contest_key not in previous_keys]
-    contests.sort(
-        key=lambda contest: (
-            _status_rank(contest.status),
-            contest.start or datetime.max.replace(tzinfo=timezone.utc),
-            contest.title.casefold(),
-        )
-    )
-    return contests
-
-
-async def send_new_contest_notifications(
+async def notify_unnotified_contests(
     *,
-    webhook_url: str,
-    contests: list[StoredContest],
-    timeout_seconds: float,
-) -> int:
-    if not contests:
-        logging.info("No CTF contests to notify.")
-        return 0
-
-    timeout = aiohttp.ClientTimeout(total=timeout_seconds)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        webhook = discord.Webhook.from_url(webhook_url, session=session)
-        sent = 0
-        for contest in contests:
-            embed = build_stored_contest_embeds("CTF 알림", [contest])[0]
-            await webhook.send(
-                content=f"새 CTF 감지 | {_status_label(contest.status)} | {contest.source_label}",
-                embed=embed,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-            sent += 1
-        return sent
-
-
-async def notify_from_snapshot_diff(
-    *,
-    previous_db_path: str | Path,
-    current_db_path: str | Path,
+    db_path: str | Path,
     webhook_url: str | None,
     timeout_seconds: float,
     dry_run: bool,
 ) -> int:
-    contests = find_new_contests(previous_db_path, current_db_path)
+    repository = ContestRepository(str(db_path))
+    contests = repository.list_unnotified_contests()
     if not contests:
+        logging.info("No CTF contests to notify.")
         return 0
 
     if dry_run:
@@ -119,20 +57,28 @@ async def notify_from_snapshot_diff(
         logging.info("DISCORD_WEBHOOK_URL is not set. Skipping webhook notifications.")
         return 0
 
-    return await send_new_contest_notifications(
-        webhook_url=webhook_url,
-        contests=contests,
-        timeout_seconds=timeout_seconds,
-    )
+    timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        webhook = discord.Webhook.from_url(webhook_url, session=session)
+        sent = 0
+        for contest in contests:
+            embed = build_stored_contest_embeds("CTF 알림", [contest])[0]
+            try:
+                await webhook.send(
+                    content=f"새 CTF 감지 | {_status_label(contest.status)} | {contest.source_label}",
+                    embed=embed,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            except discord.DiscordException as exc:
+                logging.exception("Failed to send Discord notification for %s: %s", contest.title, exc)
+                continue
+            repository.mark_contests_notified([contest.contest_key], notified_at=datetime.now(timezone.utc))
+            sent += 1
+        return sent
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Notify Discord webhook about newly discovered CTF contests.")
-    parser.add_argument(
-        "--previous-db",
-        default=os.getenv("PREVIOUS_CTF_DB_PATH", "data/ctf_snapshot.previous.db"),
-        help="Path to the previous SQLite snapshot.",
-    )
+    parser = argparse.ArgumentParser(description="Notify Discord webhook about unnotified CTF contests.")
     parser.add_argument(
         "--current-db",
         default=os.getenv("CTF_DB_PATH", DEFAULT_DB_PATH),
@@ -154,9 +100,8 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
     sent = asyncio.run(
-        notify_from_snapshot_diff(
-            previous_db_path=args.previous_db,
-            current_db_path=args.current_db,
+        notify_unnotified_contests(
+            db_path=args.current_db,
             webhook_url=os.getenv("DISCORD_WEBHOOK_URL", "").strip() or None,
             timeout_seconds=_read_float("HTTP_TIMEOUT_SECONDS", 10.0),
             dry_run=args.dry_run,

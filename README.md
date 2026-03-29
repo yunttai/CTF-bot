@@ -59,20 +59,21 @@ HTTP_TIMEOUT_SECONDS=10
 ## GitHub Actions
 - 코드가 push되면 즉시 한 번 실행됩니다. 단, `data/ctf_snapshot.db`만 바뀐 push는 무시합니다.
 - `.github/workflows/update-ctf-db.yml`가 UTC 기준 매 정시에 스냅샷을 갱신합니다.
-- 저장소에 커밋된 `data/ctf_snapshot.db`가 첫 비교 기준이 됩니다.
-- workflow는 이전 DB를 백업한 뒤 `python -m ctf_bot.updater`를 실행합니다.
-- 그 다음 `python -m ctf_bot.notifier`가 이전/현재 DB를 비교해서 새로 유입된 `upcoming`/`ongoing` CTF만 Discord 웹훅으로 전송합니다.
+- `contests` 테이블에는 `discord_notified`, `discord_notified_at` 컬럼이 있어서 각 CTF가 디스코드로 전송됐는지 추적합니다.
+- workflow는 `python -m ctf_bot.updater`를 실행해 스냅샷을 갱신하되, 기존 `contest_key`의 전송 상태는 유지합니다.
+- 그 다음 `python -m ctf_bot.notifier`가 DB에서 `discord_notified = 0`인 `upcoming`/`ongoing` CTF만 Discord 웹훅으로 전송합니다.
+- 전송 성공한 항목은 즉시 `discord_notified = 1`로 갱신되고, `discord_notified_at`에 시각이 기록됩니다.
 - 알림 Embed에는 출처가 `CTFtime`인지 `K-CTF`인지 포함됩니다.
 - 마지막으로 `data/ctf_snapshot.db`를 커밋/푸시합니다.
 - 스냅샷 메타데이터가 매번 갱신되므로 workflow가 돌 때마다 커밋이 생성됩니다.
-- 처음 push 전에 `python -m ctf_bot.updater`를 한 번 실행해서 현재 진행 중/예정 CTF가 들어간 DB를 함께 커밋하면 됩니다.
+- 로컬에서 처음 DB를 만들면 모든 항목이 `discord_notified = 0`으로 들어가므로, 첫 알림 실행 때 아직 안 보낸 CTF들이 전송됩니다.
 
 GitHub 저장소 설정의 `Settings > Secrets and variables > Actions`에 `DISCORD_WEBHOOK_URL` secret을 추가하면 됩니다.
 
 로컬에서 알림 diff만 시험하려면 아래처럼 dry run을 돌리면 됩니다.
 
 ```bash
-.\.venv\Scripts\python -m ctf_bot.notifier --previous-db data/ctf_snapshot.previous.db --current-db data/ctf_snapshot.db --dry-run
+.\.venv\Scripts\python -m ctf_bot.notifier --current-db data/ctf_snapshot.db --dry-run
 ```
 
 ## KCTF 참고

@@ -86,3 +86,5 @@ class StoredContest:
     finals_period: str | None
     mode: str | None
     scraped_at: datetime
+    discord_notified: bool = False
+    discord_notified_at: datetime | None = None

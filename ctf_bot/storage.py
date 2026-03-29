@@ -34,6 +34,15 @@ class ContestRepository:
         self.initialize()
         with closing(self._connect()) as connection:
             self._create_schema(connection)
+            existing_notification_state = {
+                row["contest_key"]: (
+                    bool(row["discord_notified"]),
+                    datetime.fromisoformat(row["discord_notified_at"]) if row["discord_notified_at"] else None,
+                )
+                for row in connection.execute(
+                    "SELECT contest_key, discord_notified, discord_notified_at FROM contests"
+                ).fetchall()
+            }
             connection.execute("BEGIN")
             connection.execute("DELETE FROM contests")
             connection.executemany(
@@ -60,8 +69,10 @@ class ContestRepository:
                     contest_period,
                     finals_period,
                     mode,
-                    scraped_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    scraped_at,
+                    discord_notified,
+                    discord_notified_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
@@ -87,6 +98,18 @@ class ContestRepository:
                         contest.finals_period,
                         contest.mode,
                         contest.scraped_at.isoformat(),
+                        1
+                        if existing_notification_state.get(contest.contest_key, (contest.discord_notified, contest.discord_notified_at))[0]
+                        else 0,
+                        (
+                            existing_notification_state.get(contest.contest_key, (contest.discord_notified, contest.discord_notified_at))[1]
+                            or contest.discord_notified_at
+                        ).isoformat()
+                        if (
+                            existing_notification_state.get(contest.contest_key, (contest.discord_notified, contest.discord_notified_at))[1]
+                            or contest.discord_notified_at
+                        )
+                        else None,
                     )
                     for contest in contests
                 ],
@@ -105,6 +128,78 @@ class ContestRepository:
                 ("record_count", str(count)),
             )
             connection.commit()
+
+    def list_unnotified_contests(self, limit: int | None = None) -> list[StoredContest]:
+        if not self.db_path.exists():
+            raise StorageError(f"CTF DB not found: {self.db_path}")
+
+        self.delete_finished_contests()
+
+        query = [
+            """
+            SELECT
+                contest_key,
+                source,
+                source_label,
+                source_id,
+                title,
+                normalized_title,
+                status,
+                detail_url,
+                organizer,
+                start_at,
+                finish_at,
+                format,
+                weight,
+                participants,
+                onsite,
+                location,
+                image_url,
+                registration_period,
+                contest_period,
+                finals_period,
+                mode,
+                scraped_at,
+                discord_notified,
+                discord_notified_at
+            FROM contests
+            WHERE discord_notified = 0
+            ORDER BY CASE WHEN status = 'ongoing' THEN 0 ELSE 1 END,
+                     CASE WHEN start_at IS NULL THEN 1 ELSE 0 END,
+                     start_at,
+                     title
+            """
+        ]
+        params: list[object] = []
+        if limit is not None:
+            query.append("LIMIT ?")
+            params.append(limit)
+
+        with closing(self._connect()) as connection:
+            rows = connection.execute("\n".join(query), params).fetchall()
+        return [self._row_to_stored_contest(row) for row in rows]
+
+    def mark_contests_notified(self, contest_keys: Iterable[str], notified_at: datetime | None = None) -> int:
+        keys = list(dict.fromkeys(contest_keys))
+        if not keys or not self.db_path.exists():
+            return 0
+
+        mark_time = (notified_at or datetime.now(timezone.utc)).isoformat()
+        placeholders = ", ".join("?" for _ in keys)
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN")
+            cursor = connection.execute(
+                f"""
+                UPDATE contests
+                SET discord_notified = 1,
+                    discord_notified_at = ?
+                WHERE contest_key IN ({placeholders})
+                """,
+                [mark_time, *keys],
+            )
+            updated = cursor.rowcount if cursor.rowcount is not None else 0
+            connection.commit()
+        return updated
 
     def delete_finished_contests(self, reference_time: datetime | None = None) -> int:
         if not self.db_path.exists():
@@ -164,7 +259,9 @@ class ContestRepository:
                 contest_period,
                 finals_period,
                 mode,
-                scraped_at
+                scraped_at,
+                discord_notified,
+                discord_notified_at
             FROM contests
             WHERE 1=1
             """
@@ -231,17 +328,28 @@ class ContestRepository:
                 contest_period TEXT,
                 finals_period TEXT,
                 mode TEXT,
-                scraped_at TEXT NOT NULL
+                scraped_at TEXT NOT NULL,
+                discord_notified INTEGER NOT NULL DEFAULT 0,
+                discord_notified_at TEXT
             );
 
             CREATE TABLE IF NOT EXISTS metadata (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
-
+            """
+        )
+        existing_columns = {row["name"] for row in connection.execute("PRAGMA table_info(contests)").fetchall()}
+        if "discord_notified" not in existing_columns:
+            connection.execute("ALTER TABLE contests ADD COLUMN discord_notified INTEGER NOT NULL DEFAULT 0")
+        if "discord_notified_at" not in existing_columns:
+            connection.execute("ALTER TABLE contests ADD COLUMN discord_notified_at TEXT")
+        connection.executescript(
+            """
             CREATE INDEX IF NOT EXISTS idx_contests_status_start ON contests(status, start_at);
             CREATE INDEX IF NOT EXISTS idx_contests_source_status ON contests(source, status);
             CREATE INDEX IF NOT EXISTS idx_contests_title ON contests(title);
+            CREATE INDEX IF NOT EXISTS idx_contests_notified_status ON contests(discord_notified, status, start_at);
             """
         )
 
@@ -269,4 +377,10 @@ class ContestRepository:
             finals_period=row["finals_period"],
             mode=row["mode"],
             scraped_at=datetime.fromisoformat(row["scraped_at"]),
+            discord_notified=bool(row["discord_notified"]) if "discord_notified" in row.keys() else False,
+            discord_notified_at=(
+                datetime.fromisoformat(row["discord_notified_at"])
+                if "discord_notified_at" in row.keys() and row["discord_notified_at"]
+                else None
+            ),
         )
