@@ -1,5 +1,5 @@
 # CTF-bot
-CTFtime과 K-CTF 정보를 조회하는 디스코드 봇입니다. 다가오는/진행 중 대회는 리포지토리의 SQLite DB 스냅샷에서 읽고, GitHub Actions는 1시간마다 새 CTF를 Discord 웹훅으로 알릴 수 있습니다.
+CTFtime과 K-CTF 정보를 조회하는 디스코드 봇입니다.GitHub Actions로 1시간마다 새 CTF를 Discord 웹훅으로 알릴 수 있습니다.
 
 ## 기능
 - `/ctf upcoming`: 다가오는 CTF 조회
