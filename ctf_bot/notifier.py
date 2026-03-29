@@ -65,7 +65,6 @@ async def notify_unnotified_contests(
             embed = build_stored_contest_embeds("CTF 알림", [contest])[0]
             try:
                 await webhook.send(
-                    content=f"새 CTF 감지 | {_status_label(contest.status)} | {contest.source_label}",
                     embed=embed,
                     allowed_mentions=discord.AllowedMentions.none(),
                 )
