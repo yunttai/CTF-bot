@@ -1,6 +1,9 @@
 name: Update CTF DB and Notify
 
 on:
+  push:
+    paths-ignore:
+      - "data/ctf_snapshot.db"
   schedule:
     - cron: "0 * * * *"
   workflow_dispatch:
