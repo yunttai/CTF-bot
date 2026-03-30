@@ -1,0 +1,38 @@
+name: Monitor CTF DB Schedule
+
+on:
+  schedule:
+    - cron: "10 * * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+  issues: write
+
+concurrency:
+  group: monitor-ctf-schedule
+  cancel-in-progress: false
+
+jobs:
+  check-schedule-health:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Check update workflow freshness
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          TARGET_WORKFLOW_PATH: .github/workflows/update-ctf-db.yml
+          MAX_SCHEDULE_LAG_MINUTES: "80"
+          ALERT_ISSUE_TITLE: "Scheduled CTF DB refresh appears stale"
+        run: python .github/scripts/check_schedule_health.py

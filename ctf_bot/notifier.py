@@ -102,7 +102,7 @@ def main() -> None:
         notify_unnotified_contests(
             db_path=args.current_db,
             webhook_url=os.getenv("DISCORD_WEBHOOK_URL", "").strip() or None,
-            timeout_seconds=_read_float("HTTP_TIMEOUT_SECONDS", 10.0),
+            timeout_seconds=_read_float("HTTP_TIMEOUT_SECONDS", 30.0),
             dry_run=args.dry_run,
         )
     )

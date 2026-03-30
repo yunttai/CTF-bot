@@ -34,7 +34,9 @@ CTF_DB_PATH=data/ctf_snapshot.db
 CTFTIME_BASE_URL=https://ctftime.org
 CTFTIME_FETCH_LIMIT=100
 KCTF_BASE_URL=http://k-ctf.org
-HTTP_TIMEOUT_SECONDS=10
+HTTP_TIMEOUT_SECONDS=30
+HTTP_RETRY_ATTEMPTS=3
+HTTP_RETRY_BACKOFF_SECONDS=1.5
 ```
 
 - `DISCORD_WEBHOOK_URL`: GitHub Actions가 새 CTF를 자동 알림할 Discord 웹훅 URL입니다. 웹훅 알림만 쓸 거면 이것만 GitHub Actions secret으로 넣어도 됩니다.
@@ -58,9 +60,11 @@ HTTP_TIMEOUT_SECONDS=10
 
 ## GitHub Actions
 - 코드가 push되면 즉시 한 번 실행됩니다. 단, `data/ctf_snapshot.db`만 바뀐 push는 무시합니다.
-- `.github/workflows/update-ctf-db.yml`가 UTC 기준 매 정시에 스냅샷을 갱신합니다.
+- `.github/workflows/update-ctf-db.yml`가 UTC 기준 매시 40분에 스냅샷을 갱신합니다.
+- `.github/workflows/monitor-ctf-schedule.yml`가 UTC 기준 매시 10분에 마지막 scheduled run을 점검하고, 일정 시간 이상 갱신이 없거나 마지막 scheduled run이 실패하면 이슈를 열거나 갱신합니다.
 - `contests` 테이블에는 `discord_notified`, `discord_notified_at` 컬럼이 있어서 각 CTF가 디스코드로 전송됐는지 추적합니다.
 - workflow는 `python -m ctf_bot.updater`를 실행해 스냅샷을 갱신하되, 기존 `contest_key`의 전송 상태는 유지합니다.
+- `K-CTF` 수집이 일시적으로 실패하면 updater는 직전 스냅샷의 `K-CTF` 데이터를 유지하고 `CTFtime` 갱신은 계속 진행합니다.
 - 그 다음 `python -m ctf_bot.notifier`가 DB에서 `discord_notified = 0`인 `upcoming`/`ongoing` CTF만 Discord 웹훅으로 전송합니다.
 - 전송 성공한 항목은 즉시 `discord_notified = 1`로 갱신되고, `discord_notified_at`에 시각이 기록됩니다.
 - 알림 Embed에는 출처가 `CTFtime`인지 `K-CTF`인지 포함됩니다.
@@ -83,6 +87,8 @@ GitHub 저장소 설정의 `Settings > Secrets and variables > Actions`에 `DISC
 
 - `GET /api/announcements/latest`
 - `GET /api/contest-update-logs`
+
+외부 HTTP 호출은 기본 30초 타임아웃과 지수 backoff retry를 사용합니다. 기본값은 `HTTP_RETRY_ATTEMPTS=3`, `HTTP_RETRY_BACKOFF_SECONDS=1.5`입니다.
 
 ## 개발 메모
 - `DISCORD_GUILD_ID`를 지정하면 슬래시 커맨드를 해당 길드에 빠르게 동기화합니다.

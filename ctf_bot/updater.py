@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 from ctf_bot.api_clients import CTFTimeClient, KCTFClient
 from ctf_bot.dedupe import normalize_title, titles_overlap
 from ctf_bot.models import CTFEvent, KCTFContest, StoredContest
-from ctf_bot.storage import ContestRepository, DEFAULT_DB_PATH
+from ctf_bot.storage import ContestRepository, DEFAULT_DB_PATH, StorageError
 
 
 def _read_int(name: str, default: int) -> int:
@@ -113,24 +113,94 @@ async def _enrich_kctf_contests(client: KCTFClient, contests: list[KCTFContest])
     return await asyncio.gather(*(enrich(contest) for contest in contests))
 
 
-async def build_snapshot_records() -> list[StoredContest]:
+def _filter_fallback_kctf_contests(
+    contests: list[StoredContest],
+    *,
+    ctftime_titles: list[str],
+    now: datetime,
+) -> list[StoredContest]:
+    return [
+        contest
+        for contest in contests
+        if _should_keep_snapshot_contest(contest, now)
+        and not any(titles_overlap(contest.title, title) for title in ctftime_titles)
+    ]
+
+
+async def _build_kctf_snapshot_records(
+    client: KCTFClient,
+    *,
+    now: datetime,
+    scraped_at: datetime,
+    ctftime_titles: list[str],
+    previous_kctf_contests: list[StoredContest],
+) -> list[StoredContest]:
+    try:
+        kctf_upcoming, kctf_ongoing = await asyncio.gather(
+            client.list_contests(status="upcoming", limit=None),
+            client.list_contests(status="ongoing", limit=None),
+        )
+    except Exception as exc:
+        fallback_contests = _filter_fallback_kctf_contests(
+            previous_kctf_contests,
+            ctftime_titles=ctftime_titles,
+            now=now,
+        )
+        logging.warning(
+            "Failed to refresh K-CTF contests. Keeping %s contest(s) from the previous snapshot: %s",
+            len(fallback_contests),
+            exc,
+        )
+        return fallback_contests
+
+    enriched_upcoming, enriched_ongoing = await asyncio.gather(
+        _enrich_kctf_contests(client, kctf_upcoming),
+        _enrich_kctf_contests(client, kctf_ongoing),
+    )
+
+    stored_contests: list[StoredContest] = []
+    for fallback_status, contests in (("ongoing", enriched_ongoing), ("upcoming", enriched_upcoming)):
+        for contest in contests:
+            resolved_status = _resolve_kctf_status(contest, fallback_status, now)
+            if resolved_status is None:
+                continue
+            if any(titles_overlap(contest.title, title) for title in ctftime_titles):
+                continue
+            stored_contests.append(_kctf_to_stored_contest(contest, resolved_status, scraped_at))
+    return stored_contests
+
+
+async def build_snapshot_records(previous_kctf_contests: list[StoredContest] | None = None) -> list[StoredContest]:
     load_dotenv()
 
     ctftime_base_url = os.getenv("CTFTIME_BASE_URL", "https://ctftime.org").strip().rstrip("/")
     ctftime_fetch_limit = _read_int("CTFTIME_FETCH_LIMIT", 100)
     kctf_base_url = os.getenv("KCTF_BASE_URL", "http://k-ctf.org").strip().rstrip("/")
-    timeout_seconds = _read_float("HTTP_TIMEOUT_SECONDS", 20.0)
+    timeout_seconds = _read_float("HTTP_TIMEOUT_SECONDS", 30.0)
+    retry_attempts = _read_int("HTTP_RETRY_ATTEMPTS", 3)
+    retry_backoff_seconds = _read_float("HTTP_RETRY_BACKOFF_SECONDS", 1.5)
     scraped_at = datetime.now(timezone.utc)
+    previous_kctf_contests = previous_kctf_contests or []
 
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_seconds)) as session:
-        ctftime = CTFTimeClient(session, ctftime_base_url, ctftime_fetch_limit)
-        kctf = KCTFClient(session, kctf_base_url)
-
-        all_ctftime_events, kctf_upcoming, kctf_ongoing = await asyncio.gather(
-            ctftime.all_events(limit=None),
-            kctf.list_contests(status="upcoming", limit=None),
-            kctf.list_contests(status="ongoing", limit=None),
+    async with aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=timeout_seconds),
+        headers={"User-Agent": "CTF-bot/0.1.0 (+https://github.com/yunttai/CTF-bot)"},
+    ) as session:
+        ctftime = CTFTimeClient(
+            session,
+            ctftime_base_url,
+            ctftime_fetch_limit,
+            retry_attempts=retry_attempts,
+            retry_backoff_seconds=retry_backoff_seconds,
         )
+        kctf = KCTFClient(
+            session,
+            kctf_base_url,
+            retry_attempts=retry_attempts,
+            retry_backoff_seconds=retry_backoff_seconds,
+        )
+
+        all_ctftime_events = await ctftime.all_events(limit=None)
 
         now = datetime.now(timezone.utc)
         stored_contests: list[StoredContest] = []
@@ -144,19 +214,15 @@ async def build_snapshot_records() -> list[StoredContest]:
                 stored_contests.append(_event_to_stored_contest(event, "upcoming", scraped_at))
                 ctftime_titles.append(event.title)
 
-        enriched_upcoming, enriched_ongoing = await asyncio.gather(
-            _enrich_kctf_contests(kctf, kctf_upcoming),
-            _enrich_kctf_contests(kctf, kctf_ongoing),
+        stored_contests.extend(
+            await _build_kctf_snapshot_records(
+                kctf,
+                now=now,
+                scraped_at=scraped_at,
+                ctftime_titles=ctftime_titles,
+                previous_kctf_contests=previous_kctf_contests,
+            )
         )
-
-        for fallback_status, contests in (("ongoing", enriched_ongoing), ("upcoming", enriched_upcoming)):
-            for contest in contests:
-                resolved_status = _resolve_kctf_status(contest, fallback_status, now)
-                if resolved_status is None:
-                    continue
-                if any(titles_overlap(contest.title, title) for title in ctftime_titles):
-                    continue
-                stored_contests.append(_kctf_to_stored_contest(contest, resolved_status, scraped_at))
 
         stored_contests = [contest for contest in stored_contests if _should_keep_snapshot_contest(contest, now)]
         stored_contests.sort(
@@ -171,7 +237,13 @@ async def build_snapshot_records() -> list[StoredContest]:
 
 async def update_snapshot(db_path: str | None = None) -> tuple[str, int]:
     repository = ContestRepository(db_path or os.getenv("CTF_DB_PATH", DEFAULT_DB_PATH))
-    contests = await build_snapshot_records()
+    previous_kctf_contests: list[StoredContest] = []
+    try:
+        previous_kctf_contests = repository.list_contests(source="k-ctf")
+    except StorageError:
+        previous_kctf_contests = []
+
+    contests = await build_snapshot_records(previous_kctf_contests=previous_kctf_contests)
     refreshed_at = datetime.now(timezone.utc)
     repository.replace_snapshot(contests, refreshed_at=refreshed_at)
     return str(repository.db_path), len(contests)

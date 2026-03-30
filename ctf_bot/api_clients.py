@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
+import logging
 import re
-from typing import Any
+from typing import Any, Awaitable, Callable, TypeVar
 from urllib.parse import urljoin
 
 import aiohttp
@@ -13,6 +15,70 @@ from ctf_bot.models import CTFEvent, KCTFAnnouncement, KCTFContest, KCTFUpdateLo
 
 class APIClientError(RuntimeError):
     """Raised when a remote API call fails."""
+
+
+T = TypeVar("T")
+RETRYABLE_STATUS_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
+
+
+def _retry_delay(base_seconds: float, attempt: int) -> float:
+    return max(base_seconds, 0.0) * (2 ** (attempt - 1))
+
+
+async def _get_with_retries(
+    session: aiohttp.ClientSession,
+    *,
+    url: str,
+    service_name: str,
+    retry_attempts: int,
+    retry_backoff_seconds: float,
+    parser: Callable[[aiohttp.ClientResponse], Awaitable[T]],
+    params: dict[str, str] | None = None,
+) -> T:
+    attempts = max(retry_attempts, 1)
+    last_error: Exception | None = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            retry_status: int | None = None
+            response_preview = ""
+            async with session.get(url, params=params) as response:
+                if response.status in RETRYABLE_STATUS_CODES and attempt < attempts:
+                    retry_status = response.status
+                    response_preview = (await response.text()).strip()[:200]
+                else:
+                    return await parser(response)
+
+            delay = _retry_delay(retry_backoff_seconds, attempt)
+            logging.warning(
+                "%s request to %s returned %s on attempt %s/%s. Retrying in %.1fs.%s",
+                service_name,
+                url,
+                retry_status,
+                attempt,
+                attempts,
+                delay,
+                f" Body: {response_preview}" if response_preview else "",
+            )
+            await asyncio.sleep(delay)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            last_error = exc
+            if attempt >= attempts:
+                break
+
+            delay = _retry_delay(retry_backoff_seconds, attempt)
+            logging.warning(
+                "%s request to %s failed on attempt %s/%s: %s. Retrying in %.1fs.",
+                service_name,
+                url,
+                attempt,
+                attempts,
+                exc,
+                delay,
+            )
+            await asyncio.sleep(delay)
+
+    raise APIClientError(f"{service_name} request to {url} failed after {attempts} attempt(s).") from last_error
 
 
 def _parse_datetime(value: str) -> datetime:
@@ -54,21 +120,41 @@ def _parse_kctf_range(value: str) -> tuple[datetime, datetime] | None:
 
 
 class CTFTimeClient:
-    def __init__(self, session: aiohttp.ClientSession, base_url: str, fetch_limit: int = 100) -> None:
+    def __init__(
+        self,
+        session: aiohttp.ClientSession,
+        base_url: str,
+        fetch_limit: int = 100,
+        *,
+        retry_attempts: int = 3,
+        retry_backoff_seconds: float = 1.5,
+    ) -> None:
         self._session = session
         self._base_url = base_url.rstrip("/")
         self._fetch_limit = max(fetch_limit, 20)
+        self._retry_attempts = max(retry_attempts, 1)
+        self._retry_backoff_seconds = max(retry_backoff_seconds, 0.0)
 
     async def _fetch_events(self, limit: int | None) -> list[CTFEvent]:
         fetch_size = self._fetch_limit if limit is None else max(limit, self._fetch_limit)
         params = {"limit": str(fetch_size)}
         url = f"{self._base_url}/api/v1/events/"
-        async with self._session.get(url, params=params) as response:
+
+        async def parse_response(response: aiohttp.ClientResponse) -> Any:
             if response.status != 200:
                 text = await response.text()
                 raise APIClientError(f"CTFtime API request failed with {response.status}: {text[:200]}")
+            return await response.json()
 
-            payload = await response.json()
+        payload = await _get_with_retries(
+            self._session,
+            url=url,
+            params=params,
+            service_name="CTFtime",
+            retry_attempts=self._retry_attempts,
+            retry_backoff_seconds=self._retry_backoff_seconds,
+            parser=parse_response,
+        )
 
         if not isinstance(payload, list):
             raise APIClientError("CTFtime API returned an unexpected response format.")
@@ -128,28 +214,59 @@ class CTFTimeClient:
 
 
 class KCTFClient:
-    def __init__(self, session: aiohttp.ClientSession, base_url: str) -> None:
+    def __init__(
+        self,
+        session: aiohttp.ClientSession,
+        base_url: str,
+        *,
+        retry_attempts: int = 3,
+        retry_backoff_seconds: float = 1.5,
+    ) -> None:
         self._session = session
         self._base_url = base_url.rstrip("/")
+        self._retry_attempts = max(retry_attempts, 1)
+        self._retry_backoff_seconds = max(retry_backoff_seconds, 0.0)
 
     def _absolute_url(self, path: str) -> str:
         return urljoin(f"{self._base_url}/", path)
 
     async def _fetch_text(self, path: str, params: dict[str, str] | None = None) -> str:
         url = f"{self._base_url}{path}"
-        async with self._session.get(url, params=params) as response:
+
+        async def parse_response(response: aiohttp.ClientResponse) -> str:
             if response.status != 200:
                 text = await response.text()
                 raise APIClientError(f"K-CTF request failed with {response.status}: {text[:200]}")
             return await response.text()
 
+        return await _get_with_retries(
+            self._session,
+            url=url,
+            params=params,
+            service_name="K-CTF",
+            retry_attempts=self._retry_attempts,
+            retry_backoff_seconds=self._retry_backoff_seconds,
+            parser=parse_response,
+        )
+
     async def _fetch_json(self, path: str, params: dict[str, str] | None = None) -> dict[str, Any]:
         url = f"{self._base_url}{path}"
-        async with self._session.get(url, params=params) as response:
+
+        async def parse_response(response: aiohttp.ClientResponse) -> Any:
             if response.status != 200:
                 text = await response.text()
                 raise APIClientError(f"K-CTF request failed with {response.status}: {text[:200]}")
-            payload = await response.json()
+            return await response.json()
+
+        payload = await _get_with_retries(
+            self._session,
+            url=url,
+            params=params,
+            service_name="K-CTF",
+            retry_attempts=self._retry_attempts,
+            retry_backoff_seconds=self._retry_backoff_seconds,
+            parser=parse_response,
+        )
 
         if not isinstance(payload, dict):
             raise APIClientError("K-CTF API returned an unexpected response format.")
